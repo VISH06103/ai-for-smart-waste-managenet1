@@ -44,7 +44,7 @@ def analyze_waste(image, api_key):
     """
     
     response = client.chat.completions.create(
-        model="llama-3.2-11b-vision-preview",
+        model="qwen/qwen3.6-27b",
         messages=[
             {
                 "role": "user",
@@ -69,7 +69,6 @@ def optimize_collection_routes(logs):
     if not logs:
         return None
     
-    # Generate mock locations for detected waste
     df = pd.DataFrame(logs)
     np.random.seed(42)
     
@@ -85,7 +84,7 @@ def optimize_collection_routes(logs):
         lambda r: r["estimated_volume_liters"] * hazard_weight.get(r["hazard_level"], 1), axis=1
     )
     
-    # Sort route by Priority Score (Highest volume & hazard picked up first)
+    # Sort route by Priority Score
     optimized_df = df.sort_values(by="priority_score", ascending=False).reset_index(drop=True)
     optimized_df["Pickup Stop"] = optimized_df.index + 1
     return optimized_df
@@ -124,7 +123,6 @@ with tab1:
                         try:
                             result = analyze_waste(image, groq_api_key)
                             
-                            # Append to session state logs
                             log_entry = {
                                 "id": f"BIN-{len(st.session_state.waste_logs) + 101}",
                                 "item": result.get("item_identified", "Unknown"),

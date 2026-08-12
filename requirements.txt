@@ -1,7 +1,6 @@
 streamlit
 groq
 tensorflow-cpu
-opencv-python-headless
 numpy
 pandas
 pillow

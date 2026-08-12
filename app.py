@@ -1,206 +1,230 @@
-import os
-import io
-import numpy as np
-import pandas as pd
-from PIL import Image
-import tensorflow as tf
-from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
-from groq import Groq
 import streamlit as st
+from groq import Groq
+from PIL import Image
+import base64
+import json
+import io
+import pandas as pd
+import plotly.express as px
+import numpy as np
 
-# ==========================================
-# 1. COMPUTER VISION & CLASSIFICATION MODULE (PIL Native)
-# ==========================================
-CLASSES = ["Organic", "Plastic", "Recyclable", "Hazardous"]
+# Page Configuration
+st.set_page_config(
+    page_title="AI Smart Waste Management System",
+    page_icon="♻️",
+    layout="wide"
+)
 
-class WasteClassifier:
-    def __init__(self):
-        # Initialize MobileNetV2 base model with custom classification head
-        base = MobileNetV2(weights="imagenet", include_top=False, input_shape=(224, 224, 3))
-        x = tf.keras.layers.GlobalAveragePooling2D()(base.output)
-        output = tf.keras.layers.Dense(len(CLASSES), activation="softmax")(x)
-        self.model = tf.keras.Model(inputs=base.input, outputs=output)
+# Initialize Session State
+if "waste_logs" not in st.session_state:
+    st.session_state.waste_logs = []
 
-    def classify(self, image_bytes: bytes):
-        # Load and preprocess using Pillow and NumPy (No OpenCV needed)
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        resized_img = image.resize((224, 224))
-        img_array = np.array(resized_img, dtype=np.float32)
-        
-        tensor = preprocess_input(np.expand_dims(img_array, axis=0))
-        preds = self.model.predict(tensor, verbose=0)[0]
-        
-        idx = int(np.argmax(preds))
-        return {
-            "category": CLASSES[idx],
-            "confidence": float(preds[idx]),
-            "probabilities": {CLASSES[i]: float(preds[i]) for i in range(len(CLASSES))}
-        }
+# Helper: Encode PIL image to Base64
+def encode_image(image):
+    buffered = io.BytesIO()
+    image.save(buffered, format="JPEG")
+    return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# ==========================================
-# 2. PRIORITY ROUTE OPTIMIZATION MODULE
-# ==========================================
-URGENCY_MULTIPLIERS = {
-    "Hazardous": 1.5,
-    "Organic": 1.3,
-    "Plastic": 1.0,
-    "Recyclable": 1.0
-}
-
-def haversine_distance(coord1: tuple, coord2: tuple) -> float:
-    """Calculates geodesic distance in kilometers between coordinates."""
-    R = 6371.0
-    lat1, lon1 = np.radians(coord1)
-    lat2, lon2 = np.radians(coord2)
-    dlat, dlon = lat2 - lat1, lon2 - lon1
-    a = np.sin(dlat / 2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2)**2
-    return R * (2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a)))
-
-def optimize_collection_route(depot_location: tuple, bins: list) -> dict:
-    """Computes a collection route prioritizing urgent and high-capacity bins."""
-    eligible_bins = [b for b in bins if b["fill_level"] >= 60.0 or b["waste_type"] == "Hazardous"]
+# Helper: Analyze image via Groq API
+def analyze_waste(image, api_key):
+    client = Groq(api_key=api_key)
+    base64_image = encode_image(image)
     
-    if not eligible_bins:
-        return {"route_order": [], "detailed_route": [], "total_distance_km": 0.0}
-
-    for b in eligible_bins:
-        multiplier = URGENCY_MULTIPLIERS.get(b["waste_type"], 1.0)
-        b["priority"] = b["fill_level"] * multiplier
-
-    unvisited = eligible_bins.copy()
-    current_pos = depot_location
-    route = []
-    total_distance = 0.0
-
-    while unvisited:
-        next_bin = max(
-            unvisited, 
-            key=lambda item: item["priority"] / (haversine_distance(current_pos, (item["lat"], item["lon"])) + 0.1)
-        )
-        dist = haversine_distance(current_pos, (next_bin["lat"], next_bin["lon"]))
-        total_distance += dist
-        current_pos = (next_bin["lat"], next_bin["lon"])
-        route.append(next_bin)
-        unvisited.remove(next_bin)
-
-    total_distance += haversine_distance(current_pos, depot_location)
-
-    return {
-        "route_order": [b["bin_id"] for b in route],
-        "detailed_route": route,
-        "total_distance_km": round(total_distance, 2)
+    prompt = """
+    Analyze this waste image. Return ONLY a valid JSON object with the following structure:
+    {
+      "category": "Plastic" or "Organic" or "Recyclable" or "Hazardous",
+      "item_identified": "Short name of object",
+      "confidence": percentage number between 80 and 99,
+      "estimated_volume_liters": estimated numeric volume in liters (e.g. 1.5),
+      "hazard_level": "Low" or "Medium" or "High",
+      "recyclable": true or false,
+      "disposal_instructions": "Brief step-by-step handling instruction"
     }
+    """
+    
+    response = client.chat.completions.create(
+        model="llama-3.2-11b-vision-preview",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
+                    }
+                ]
+            }
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"}
+    )
+    return json.loads(response.choices[0].message.content)
 
-# ==========================================
-# 3. AGENTIC AI DISPATCHER MODULE (GROQ)
-# ==========================================
-class WasteManagementAgent:
-    def __init__(self, api_key: str = None):
-        self.api_key = api_key or os.getenv("GROQ_API_KEY")
-        if self.api_key:
-            self.client = Groq(api_key=self.api_key)
-        else:
-            self.client = None
+# Route Optimization Logic (Greedy Priority Algorithm)
+def optimize_collection_routes(logs):
+    if not logs:
+        return None
+    
+    # Generate mock locations for detected waste
+    df = pd.DataFrame(logs)
+    np.random.seed(42)
+    
+    # Base location (Depot)
+    base_lat, base_lon = 37.7749, -122.4194
+    
+    df["lat"] = base_lat + np.random.uniform(-0.05, 0.05, len(df))
+    df["lon"] = base_lon + np.random.uniform(-0.05, 0.05, len(df))
+    
+    # Priority Score = Volume * Hazard Weight
+    hazard_weight = {"Low": 1, "Medium": 2, "High": 3}
+    df["priority_score"] = df.apply(
+        lambda r: r["estimated_volume_liters"] * hazard_weight.get(r["hazard_level"], 1), axis=1
+    )
+    
+    # Sort route by Priority Score (Highest volume & hazard picked up first)
+    optimized_df = df.sort_values(by="priority_score", ascending=False).reset_index(drop=True)
+    optimized_df["Pickup Stop"] = optimized_df.index + 1
+    return optimized_df
 
-    def analyze_fleet_status(self, bin_data: list, route_summary: dict) -> str:
-        if not self.client:
-            return "⚠️ **Groq API Key Missing.** Set `GROQ_API_KEY` in Streamlit Secrets or the sidebar."
-        
-        prompt = f"""
-        You are an AI Operational Dispatcher for a Smart City Waste System.
-        Analyze this telemetry and collection route, then generate a concise executive advisory report:
-        
-        Bin Telemetry: {bin_data}
-        Calculated Route: {route_summary}
-        
-        Required Sections:
-        1. 🚨 Critical Safety/Hazard Warnings
-        2. 🚛 Fleet & Route Optimization Recommendations
-        3. 📋 Action Items for Drivers
-        """
-        try:
-            chat_completion = self.client.chat.completions.create(
-                messages=[
-                    {"role": "system", "content": "You are a professional AI environmental logistics officer."},
-                    {"role": "user", "content": prompt}
-                ],
-                model="llama-3.3-70b-versatile",
-                temperature=0.3,
-                max_tokens=600
-            )
-            return chat_completion.choices[0].message.content
-        except Exception as e:
-            return f"❌ Error contacting Groq API: {str(e)}"
+# Sidebar UI
+st.sidebar.title("⚙️ Configuration")
+groq_api_key = st.sidebar.text_input("Enter Groq API Key", type="password")
 
-# ==========================================
-# 4. STREAMLIT USER INTERFACE
-# ==========================================
-st.set_page_config(page_title="Smart Waste Ops Center", layout="wide")
+st.sidebar.markdown("---")
+st.sidebar.info("Upload waste images to automatically classify waste, calculate volume, optimize pickup routes, and view analytics.")
 
-# Fetch API Key from Streamlit Secrets or Sidebar Input
-groq_key = st.secrets.get("GROQ_API_KEY", "")
-if not groq_key:
-    groq_key = st.sidebar.text_input("Enter Groq API Key:", type="password")
+# Main Application Title
+st.title("♻️ AI Smart Waste Management System")
+st.write("Automated AI Waste Categorization, Volume Estimation & Route Optimization")
 
-@st.cache_resource
-def load_classifier():
-    return WasteClassifier()
+# Tab Layout
+tab1, tab2, tab3 = st.tabs(["📸 Waste Classifier", "🗺️ Route Optimizer", "📊 Analytics Dashboard"])
 
-classifier = load_classifier()
-
-st.title("♻️ Smart Waste Management System")
-
-tab1, tab2, tab3 = st.tabs(["📸 Camera Inspection", "🗺️ Route Optimization", "🤖 Groq Agentic Ops"])
-
-# --- TAB 1: CLASSIFICATION ---
+# TAB 1: CLASSIFIER & ANALYSIS
 with tab1:
-    st.header("Waste Image Classification")
-    uploaded_file = st.file_uploader("Upload waste image...", type=["jpg", "jpeg", "png"])
+    col1, col2 = st.columns([1, 1])
     
-    if uploaded_file:
-        col1, col2 = st.columns(2)
-        image = Image.open(uploaded_file)
-        col1.image(image, caption="Uploaded Sample", use_container_width=True)
+    with col1:
+        st.subheader("Upload Waste Image")
+        uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png"])
         
-        if col1.button("Classify Waste"):
-            with st.spinner("Analyzing image..."):
-                img_byte_arr = io.BytesIO()
-                image.save(img_byte_arr, format='JPEG')
-                res = classifier.classify(img_byte_arr.getvalue())
-                
-                col2.success(f"**Category:** {res['category']}")
-                col2.info(f"**Confidence:** {res['confidence'] * 100:.2f}%")
-                col2.write("Probability Breakdown:")
-                col2.json(res["probabilities"])
+        if uploaded_file is not None:
+            image = Image.open(uploaded_file).convert("RGB")
+            st.image(image, caption="Uploaded Image", use_container_width=True)
+            
+            if not groq_api_key:
+                st.warning("⚠️ Please enter your Groq API key in the sidebar to analyze.")
+            else:
+                if st.button("🔍 Analyze Waste", type="primary"):
+                    with st.spinner("AI Agent analyzing image..."):
+                        try:
+                            result = analyze_waste(image, groq_api_key)
+                            
+                            # Append to session state logs
+                            log_entry = {
+                                "id": f"BIN-{len(st.session_state.waste_logs) + 101}",
+                                "item": result.get("item_identified", "Unknown"),
+                                "category": result.get("category", "General"),
+                                "confidence": result.get("confidence", 90),
+                                "estimated_volume_liters": float(result.get("estimated_volume_liters", 1.0)),
+                                "hazard_level": result.get("hazard_level", "Low"),
+                                "recyclable": result.get("recyclable", False),
+                                "disposal_instructions": result.get("disposal_instructions", "Standard disposal.")
+                            }
+                            st.session_state.waste_logs.append(log_entry)
+                            st.success("Analysis Complete!")
+                        except Exception as e:
+                            st.error(f"Error analyzing image: {str(e)}")
 
-# --- TAB 2: ROUTE OPTIMIZATION ---
+    with col2:
+        st.subheader("Analysis Results")
+        if st.session_state.waste_logs:
+            latest = st.session_state.waste_logs[-1]
+            
+            st.metric("Detected Item", latest["item"])
+            
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Category", latest["category"])
+            c2.metric("Volume (L)", f"{latest['estimated_volume_liters']} L")
+            c3.metric("Hazard Level", latest["hazard_level"])
+            
+            st.markdown(f"**Recyclable:** {'Yes 🟢' if latest['recyclable'] else 'No 🔴'}")
+            st.markdown(f"**AI Confidence:** {latest['confidence']}%")
+            
+            st.info(f"**Disposal Instructions:**\n\n{latest['disposal_instructions']}")
+        else:
+            st.info("Upload an image and click 'Analyze Waste' to see results.")
+
+# TAB 2: ROUTE OPTIMIZATION
 with tab2:
-    st.header("Priority Route Optimizer")
+    st.subheader("🚛 Waste Collection Route Optimization")
     
-    mock_bins = [
-        {"bin_id": "BIN-101", "lat": 12.9716, "lon": 77.5946, "fill_level": 85.0, "waste_type": "Organic"},
-        {"bin_id": "BIN-102", "lat": 12.9750, "lon": 77.6000, "fill_level": 92.0, "waste_type": "Hazardous"},
-        {"bin_id": "BIN-103", "lat": 12.9650, "lon": 77.5800, "fill_level": 40.0, "waste_type": "Plastic"},
-        {"bin_id": "BIN-104", "lat": 12.9800, "lon": 77.6100, "fill_level": 78.0, "waste_type": "Recyclable"}
-    ]
-    
-    st.dataframe(pd.DataFrame(mock_bins), use_container_width=True)
-    
-    if st.button("Calculate Priority Route"):
-        route_data = optimize_collection_route((12.9700, 77.5900), mock_bins)
-        st.success(f"Optimized Route Distance: **{route_data['total_distance_km']} km**")
-        st.write(" **Sequence:** " + " ➔ ".join(["Depot"] + route_data["route_order"] + ["Depot"]))
+    if not st.session_state.waste_logs:
+        st.warning("No waste data available yet. Classify some items in the 'Waste Classifier' tab first.")
+    else:
+        optimized_data = optimize_collection_routes(st.session_state.waste_logs)
         
-        map_df = pd.DataFrame(route_data["detailed_route"])
-        if not map_df.empty:
-            st.map(map_df[["lat", "lon"]])
+        col_map, col_table = st.columns([1.2, 1])
+        
+        with col_map:
+            st.markdown("#### Pickup Map (Priority-Based Path)")
+            fig = px.scatter_mapbox(
+                optimized_data,
+                lat="lat",
+                lon="lon",
+                hover_name="item",
+                hover_data=["category", "estimated_volume_liters", "hazard_level", "Pickup Stop"],
+                color="category",
+                size="estimated_volume_liters",
+                zoom=11,
+                height=450
+            )
+            fig.update_layout(mapbox_style="open-street-map")
+            st.plotly_chart(fig, use_container_width=True)
+            
+        with col_table:
+            st.markdown("#### Optimized Pickup Sequence")
+            st.dataframe(
+                optimized_data[["Pickup Stop", "id", "item", "category", "estimated_volume_liters", "hazard_level"]],
+                use_container_width=True,
+                hide_index=True
+            )
 
-# --- TAB 3: GROQ AGENTIC AI ---
+# TAB 3: ANALYTICS DASHBOARD
 with tab3:
-    st.header("Groq Llama-3 Operational Advisory")
-    if st.button("Run AI Agent Assessment"):
-        with st.spinner("Analyzing fleet telemetry with Groq..."):
-            agent = WasteManagementAgent(api_key=groq_key)
-            route_data = optimize_collection_route((12.9700, 77.5900), mock_bins)
-            report = agent.analyze_fleet_status(mock_bins, route_data)
-            st.markdown(report)
+    st.subheader("📈 Waste Management Analytics")
+    
+    if not st.session_state.waste_logs:
+        st.warning("No data recorded yet. Upload images to populate the dashboard.")
+    else:
+        df_logs = pd.DataFrame(st.session_state.waste_logs)
+        
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total Items Processed", len(df_logs))
+        m2.metric("Total Volume Collected", f"{df_logs['estimated_volume_liters'].sum():.1f} L")
+        m3.metric("Recyclable Ratio", f"{(df_logs['recyclable'].mean() * 100):.1f}%")
+        m4.metric("High Hazard Bins", len(df_logs[df_logs["hazard_level"] == "High"]))
+        
+        st.markdown("---")
+        
+        c1, c2 = st.columns(2)
+        
+        with c1:
+            st.markdown("#### Waste Distribution by Category")
+            fig_pie = px.pie(df_logs, names="category", title="Waste Types Breakdown", hole=0.4)
+            st.plotly_chart(fig_pie, use_container_width=True)
+            
+        with c2:
+            st.markdown("#### Total Volume by Category (Liters)")
+            fig_bar = px.bar(
+                df_logs.groupby("category")["estimated_volume_liters"].sum().reset_index(),
+                x="category",
+                y="estimated_volume_liters",
+                color="category",
+                labels={"estimated_volume_liters": "Volume (L)", "category": "Category"}
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)

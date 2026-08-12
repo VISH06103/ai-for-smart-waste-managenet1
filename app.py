@@ -1,6 +1,5 @@
 import os
 import io
-import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image
@@ -10,28 +9,25 @@ from groq import Groq
 import streamlit as st
 
 # ==========================================
-# 1. COMPUTER VISION & CLASSIFIER MODULE
+# 1. COMPUTER VISION & CLASSIFICATION MODULE (PIL Native)
 # ==========================================
 CLASSES = ["Organic", "Plastic", "Recyclable", "Hazardous"]
 
 class WasteClassifier:
     def __init__(self):
-        # MobileNetV2 lightweight base model initialized for inference
+        # Initialize MobileNetV2 base model with custom classification head
         base = MobileNetV2(weights="imagenet", include_top=False, input_shape=(224, 224, 3))
         x = tf.keras.layers.GlobalAveragePooling2D()(base.output)
         output = tf.keras.layers.Dense(len(CLASSES), activation="softmax")(x)
         self.model = tf.keras.Model(inputs=base.input, outputs=output)
 
     def classify(self, image_bytes: bytes):
-        nparr = np.frombuffer(image_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        # Load and preprocess using Pillow and NumPy (No OpenCV needed)
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        resized_img = image.resize((224, 224))
+        img_array = np.array(resized_img, dtype=np.float32)
         
-        # OpenCV Preprocessing: Color conversion, Gaussian noise reduction, resizing
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        blurred = cv2.GaussianBlur(img_rgb, (5, 5), 0)
-        resized = cv2.resize(blurred, (224, 224))
-        
-        tensor = preprocess_input(np.expand_dims(resized.astype(np.float32), axis=0))
+        tensor = preprocess_input(np.expand_dims(img_array, axis=0))
         preds = self.model.predict(tensor, verbose=0)[0]
         
         idx = int(np.argmax(preds))
@@ -52,7 +48,7 @@ URGENCY_MULTIPLIERS = {
 }
 
 def haversine_distance(coord1: tuple, coord2: tuple) -> float:
-    """Calculates distance in kilometers between two lat/lon pairs."""
+    """Calculates geodesic distance in kilometers between coordinates."""
     R = 6371.0
     lat1, lon1 = np.radians(coord1)
     lat2, lon2 = np.radians(coord2)
@@ -61,7 +57,7 @@ def haversine_distance(coord1: tuple, coord2: tuple) -> float:
     return R * (2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a)))
 
 def optimize_collection_route(depot_location: tuple, bins: list) -> dict:
-    """Priority-weighted Nearest Neighbor heuristic route planner."""
+    """Computes a collection route prioritizing urgent and high-capacity bins."""
     eligible_bins = [b for b in bins if b["fill_level"] >= 60.0 or b["waste_type"] == "Hazardous"]
     
     if not eligible_bins:
@@ -77,7 +73,6 @@ def optimize_collection_route(depot_location: tuple, bins: list) -> dict:
     total_distance = 0.0
 
     while unvisited:
-        # Pick next bin maximizing priority over distance penalty
         next_bin = max(
             unvisited, 
             key=lambda item: item["priority"] / (haversine_distance(current_pos, (item["lat"], item["lon"])) + 0.1)
@@ -97,7 +92,7 @@ def optimize_collection_route(depot_location: tuple, bins: list) -> dict:
     }
 
 # ==========================================
-# 3. AGENTIC AI DISPATCHER (GROQ API)
+# 3. AGENTIC AI DISPATCHER MODULE (GROQ)
 # ==========================================
 class WasteManagementAgent:
     def __init__(self, api_key: str = None):
@@ -109,7 +104,7 @@ class WasteManagementAgent:
 
     def analyze_fleet_status(self, bin_data: list, route_summary: dict) -> str:
         if not self.client:
-            return "⚠️ **Groq API Key Missing.** Set `GROQ_API_KEY` in Streamlit Secrets or sidebar."
+            return "⚠️ **Groq API Key Missing.** Set `GROQ_API_KEY` in Streamlit Secrets or the sidebar."
         
         prompt = f"""
         You are an AI Operational Dispatcher for a Smart City Waste System.
@@ -118,7 +113,7 @@ class WasteManagementAgent:
         Bin Telemetry: {bin_data}
         Calculated Route: {route_summary}
         
-        Formatting Requirements:
+        Required Sections:
         1. 🚨 Critical Safety/Hazard Warnings
         2. 🚛 Fleet & Route Optimization Recommendations
         3. 📋 Action Items for Drivers
@@ -142,7 +137,7 @@ class WasteManagementAgent:
 # ==========================================
 st.set_page_config(page_title="Smart Waste Ops Center", layout="wide")
 
-# Retrieve API Key from Secrets or Sidebar Input
+# Fetch API Key from Streamlit Secrets or Sidebar Input
 groq_key = st.secrets.get("GROQ_API_KEY", "")
 if not groq_key:
     groq_key = st.sidebar.text_input("Enter Groq API Key:", type="password")
@@ -168,14 +163,15 @@ with tab1:
         col1.image(image, caption="Uploaded Sample", use_container_width=True)
         
         if col1.button("Classify Waste"):
-            img_byte_arr = io.BytesIO()
-            image.save(img_byte_arr, format='JPEG')
-            res = classifier.classify(img_byte_arr.getvalue())
-            
-            col2.success(f"**Category:** {res['category']}")
-            col2.info(f"**Confidence:** {res['confidence'] * 100:.2f}%")
-            col2.write("Probability Breakdown:")
-            col2.json(res["probabilities"])
+            with st.spinner("Analyzing image..."):
+                img_byte_arr = io.BytesIO()
+                image.save(img_byte_arr, format='JPEG')
+                res = classifier.classify(img_byte_arr.getvalue())
+                
+                col2.success(f"**Category:** {res['category']}")
+                col2.info(f"**Confidence:** {res['confidence'] * 100:.2f}%")
+                col2.write("Probability Breakdown:")
+                col2.json(res["probabilities"])
 
 # --- TAB 2: ROUTE OPTIMIZATION ---
 with tab2:
